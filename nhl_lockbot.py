@@ -319,7 +319,7 @@ with tabs[2]:
         ex = pd.DataFrame([{
             "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,
             "rating_home":1620,"rating_away":1605,"l10_home_winpct":0.60,"l10_away_winpct":0.55,"b2b_home":0,"b2b_away":0
-        }]])
+        }])
     else:
         st.caption("Advanced CSV requires all columns used by the Advanced tab.")
         ex = pd.DataFrame([{
