@@ -1,13 +1,10 @@
 # nhl_lockbot.py
-# LockBot NHL — NFL-style Simple Mode + Advanced + Batch (with unique keys)
-# -------------------------------------------------------------------------
-# Simple mode: enter teams, puckline (home perspective), total, ratings (optional L10 & B2B).
-# Advanced: full inputs (xG rates, injuries, goalie, travel, etc.).
-# Batch: supports simple CSV (few columns) or advanced CSV (full columns).
-#
-# Notes:
-# - Puckline is always entered from the HOME perspective (favored ⇒ negative).
-# - Locks: LockScore = 0.6*WinConf% + 0.4*OUConf% and compared to sidebar threshold.
+# LockBot NHL — NFL-style Simple Mode + Advanced + Batch + Projected Score
+# -----------------------------------------------------------------------
+# Simple mode: teams, puckline(home), total, ratings (optional L10 & B2B).
+# Advanced: full controls (xG, injuries, goalie, travel, etc.).
+# Batch: simple CSV or advanced CSV.
+# Puckline is always from the HOME perspective (favored ⇒ negative).
 
 import math
 import pandas as pd
@@ -150,15 +147,52 @@ def compute_total(row):
         "OU_Pick": f"{pick} {market_total:.1f}", "OU_Confidence_%": conf_pct
     }
 
+# ---- NEW: Projected Score (goals) ----
+def predict_goals(row):
+    """
+    Lightweight goals model (per 60):
+    - Base from each side's xGF/60 vs opponent xGA/60
+    - Finishing, injuries (own off & opp def), goalie edge
+    - Small nudge from puckline (favored tends to score slightly more)
+    """
+    home_base = max(0.5, (row.get("xgf60_home", 2.7) + row.get("xga60_away", 2.7)) / 2.0)
+    away_base = max(0.5, (row.get("xgf60_away", 2.7) + row.get("xga60_home", 2.7)) / 2.0)
+
+    home_base += 0.10 * row.get("fin_home", 0.0)
+    away_base += 0.10 * row.get("fin_away", 0.0)
+
+    home_base += 0.10 * row.get("inj_off_home", 0.0) + 0.10 * row.get("inj_def_away", 0.0)
+    away_base += 0.10 * row.get("inj_off_away", 0.0) + 0.10 * row.get("inj_def_home", 0.0)
+
+    g = row.get("goalie_edge_home", 0.0)
+    home_base += 0.08 * g
+    away_base -= 0.08 * g
+
+    pl = float(row.get("puckline_home", -1.5))
+    home_base += -0.10 * pl      # -1.5 -> +0.15
+    away_base  -= -0.10 * pl     # -1.5 -> -0.15
+
+    home_g = max(0.8, home_base)
+    away_g = max(0.8, away_base)
+    return {
+        "Pred_Home_Goals": round(home_g, 2),
+        "Pred_Away_Goals": round(away_g, 2),
+        "Pred_Total_Goals": round(home_g + away_g, 2),
+    }
+
 def score_game(row):
     win = compute_win(row)
     tot = compute_total(row)
+    proj = predict_goals(row)
     lock_score = 0.6 * win["Win_Confidence_%"] + 0.4 * tot["OU_Confidence_%"]
     return {
         "home": row.get("home"), "away": row.get("away"),
         "ML_Pick": win["ML_Pick"], "Spread_Pick": win["Spread_Pick"],
         "Win_Confidence_%": win["Win_Confidence_%"],
         "OU_Pick": tot["OU_Pick"], "OU_Confidence_%": tot["OU_Confidence_%"],
+        "Pred_Home_Goals": proj["Pred_Home_Goals"],
+        "Pred_Away_Goals": proj["Pred_Away_Goals"],
+        "Pred_Total_Goals": proj["Pred_Total_Goals"],
         "LockScore": round(lock_score, 1)
     }
 
@@ -203,6 +237,10 @@ with tabs[0]:
                 st.success("🔒 Consider this a Lock of the Day candidate.")
             else:
                 st.info("Not strong enough for 🔒 by your threshold.")
+            st.markdown(
+                f"**Projected Score:** {home} {result['Pred_Home_Goals']:.2f} — "
+                f"{away} {result['Pred_Away_Goals']:.2f}  *(Total {result['Pred_Total_Goals']:.2f})*"
+            )
 
 # --- Advanced (full inputs) ---
 with tabs[1]:
@@ -267,6 +305,10 @@ with tabs[1]:
                 st.success("🔒 Consider this a Lock of the Day candidate.")
             else:
                 st.info("Not strong enough for 🔒 by your threshold.")
+            st.markdown(
+                f"**Projected Score:** {home_a} {result['Pred_Home_Goals']:.2f} — "
+                f"{away_a} {result['Pred_Away_Goals']:.2f}  *(Total {result['Pred_Total_Goals']:.2f})*"
+            )
 
 # --- Batch (CSV) ---
 with tabs[2]:
@@ -275,9 +317,9 @@ with tabs[2]:
     if simple_csv:
         st.caption("Simple CSV needs: home,away,puckline_home,total,rating_home,rating_away (optional l10/b2b).")
         ex = pd.DataFrame([{
-            "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,"rating_home":1620,"rating_away":1605,
-            "l10_home_winpct":0.60,"l10_away_winpct":0.55,"b2b_home":0,"b2b_away":0
-        }])
+            "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,
+            "rating_home":1620,"rating_away":1605,"l10_home_winpct":0.60,"l10_away_winpct":0.55,"b2b_home":0,"b2b_away":0
+        }]])
     else:
         st.caption("Advanced CSV requires all columns used by the Advanced tab.")
         ex = pd.DataFrame([{
@@ -288,8 +330,9 @@ with tabs[2]:
             "b2b_home":0,"b2b_away":0,"inj_off_home":0.4,"inj_off_away":1.0,"inj_def_home":0.2,"inj_def_away":0.5,
             "goalie_edge_home":0.6,"fin_home":0.2,"fin_away":-0.1,"recent_ou_home":0.3,"recent_ou_away":-0.2,
             "travel_home":0,"travel_away":450
-        }])
-    st.download_button("Download CSV Template", ex.to_csv(index=False).encode(), "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
+        }]])
+    st.download_button("Download CSV Template", ex.to_csv(index=False).encode(),
+                       "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
 
     uploaded = st.file_uploader("Upload CSV", type=["csv"], key="batch_uploader")
     if uploaded is not None:
@@ -298,7 +341,9 @@ with tabs[2]:
             if simple_csv:
                 need = ["home","away","puckline_home","total","rating_home","rating_away"]
                 miss = [c for c in need if c not in df.columns]
-                if miss: st.error(f"Missing columns: {miss}"); st.stop()
+                if miss:
+                    st.error(f"Missing columns: {miss}")
+                    st.stop()
                 rows = []
                 for _, r in df.iterrows():
                     row = {k: r[k] for k in df.columns}
@@ -311,8 +356,11 @@ with tabs[2]:
                         "inj_def_home","inj_def_away","goalie_edge_home","fin_home","fin_away","recent_ou_home","recent_ou_away",
                         "travel_home","travel_away"]
                 miss = [c for c in need if c not in df.columns]
-                if miss: st.error(f"Missing columns: {miss}"); st.stop()
-                out = pd.DataFrame([score_game(dict(r)) for _, r in df.iterrows()]).sort_values("LockScore", ascending=False).reset_index(drop=True)
+                if miss:
+                    st.error(f"Missing columns: {miss}")
+                    st.stop()
+                out = pd.DataFrame([score_game(dict(r)) for _, r in df.iterrows()]) \
+                        .sort_values("LockScore", ascending=False).reset_index(drop=True)
 
             if len(out):
                 out.loc[0, "Lock"] = "🔒" if out.loc[0, "LockScore"] >= lock_min_conf else "(no 🔒)"
