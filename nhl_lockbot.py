@@ -330,7 +330,7 @@ with tabs[2]:
             "b2b_home":0,"b2b_away":0,"inj_off_home":0.4,"inj_off_away":1.0,"inj_def_home":0.2,"inj_def_away":0.5,
             "goalie_edge_home":0.6,"fin_home":0.2,"fin_away":-0.1,"recent_ou_home":0.3,"recent_ou_away":-0.2,
             "travel_home":0,"travel_away":450
-        }]])
+        }])
     st.download_button("Download CSV Template", ex.to_csv(index=False).encode(),
                        "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
 
