@@ -1,10 +1,5 @@
 # nhl_lockbot.py
-# LockBot NHL — NFL-style Simple Mode + Advanced + Batch + Projected Score + OU Blend
-# -----------------------------------------------------------------------------------
-# Simple mode: teams, puckline(home), total, ratings (optional L10 & B2B).
-# Advanced: full controls (xG, injuries, goalie, travel, etc.).
-# Batch: simple CSV or advanced CSV.
-# Puckline is always from the HOME perspective (favored ⇒ negative).
+# LockBot NHL — Simple + Advanced + Batch + Projected Score + OU Blend + Pick Rule
 
 import math
 import pandas as pd
@@ -13,7 +8,7 @@ import streamlit as st
 # ---------- App config ----------
 st.set_page_config(page_title="LockBot NHL (NFL-style)", layout="wide")
 st.title("🏒 LockBot NHL — NFL-style Simple Mode")
-st.caption("Quick inputs like your NFL app. ML / Puckline / Total picks with confidence. Batch mode + Lock of the Day 🔒")
+st.caption("ML / Puckline / Total picks with confidence. Projected score, batch mode, and tunable totals blending.")
 
 # ---------- Sidebar (globals) ----------
 st.sidebar.header("Global Settings")
@@ -40,7 +35,7 @@ w = {
     "market": st.sidebar.slider("Market Sanity (sign check)", 0.0, 1.5, 0.4, 0.05, key="w_market"),
 }
 
-st.sidebar.subheader("Weights — Totals (OU heuristic part)")
+st.sidebar.subheader("Weights — Totals (heuristic piece)")
 wt = {
     "xgpace": st.sidebar.slider("xG Pace vs avg",       0.0, 2.0, 1.3, 0.05, key="wt_pace"),
     "finish": st.sidebar.slider("Finishing (hot/cold)", 0.0, 1.5, 0.8, 0.05, key="wt_finish"),
@@ -51,16 +46,20 @@ wt = {
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Totals Blending & Calibration")
-totals_alpha = st.sidebar.slider("Blend α (Goals model vs Heuristic)", 0.0, 1.0, 0.75, 0.05, key="g_alpha")
+totals_alpha = st.sidebar.slider("Blend α (Goals vs Heuristic)", 0.0, 1.0, 0.75, 0.05, key="g_alpha")
 goals_scale  = st.sidebar.slider("Goals scale (γ)", 0.9, 1.2, 1.05, 0.01, key="g_goals_scale")
 goals_bias   = st.sidebar.slider("Goals bias (β, adds to total)", 0.0, 0.5, 0.15, 0.01, key="g_goals_bias")
+pick_rule = st.sidebar.selectbox(
+    "Totals pick rule",
+    ["Blend (use α)", "Goals only", "Heuristic only", "Consensus (both must agree)"],
+    index=0, key="g_totals_rule"
+)
 
 # ---------- Helpers ----------
 def sigmoid(x, scale):
     return 1 / (1 + math.exp(-x / max(scale, 1e-6)))
 
 def fill_defaults_minimal(row):
-    """Neutral defaults so Simple mode needs only a few inputs."""
     defaults = {
         "xgf60_home": 2.7, "xga60_home": 2.7, "xgf60_away": 2.7, "xga60_away": 2.7,
         "pp_home": 22.0, "pk_home": 80.0, "pp_away": 22.0, "pk_away": 80.0,
@@ -104,10 +103,9 @@ def compute_win(row):
     winprob_home = sigmoid(winscore, scale_win)
     ml_team = row.get("home") if winprob_home >= 0.5 else row.get("away")
 
-    # puckline from HOME perspective
-    puckline_home = float(row.get("puckline_home", -1.5))
+    puckline_home = float(row.get("puckline_home", -1.5))  # from HOME perspective
     implied_shift = -puckline_home * goal_to_winprob
-    spread_edge = (winprob_home - 0.5) - implied_shift  # >0 → model likes HOME vs market
+    spread_edge = (winprob_home - 0.5) - implied_shift
 
     def fmt_home(pl): return f"{row.get('home')} {pl:+.1f}"
     def fmt_away(pl): return f"{row.get('away')} {(-pl):+.1f}"
@@ -132,7 +130,7 @@ def compute_win(row):
     }
 
 def compute_total_heuristic(row):
-    """Old heuristic total model → a projected total around the market number."""
+    """Heuristic projection around the market total."""
     xgpace_home = row.get("xgf60_home",2.7) + row.get("xga60_home",2.7)
     xgpace_away = row.get("xgf60_away",2.7) + row.get("xga60_away",2.7)
     pace_term   = (xgpace_home + xgpace_away)/2.0 - 5.0
@@ -148,15 +146,8 @@ def compute_total_heuristic(row):
     market_shift_total = market_total + total_score * 0.6
     return market_shift_total, total_score
 
-# ---- Projected Score (goals) ----
 def predict_goals(row):
-    """
-    Lightweight goals model (per 60):
-    - Base from each side's xGF/60 vs opponent xGA/60
-    - Finishing, injuries (own off & opp def), goalie edge
-    - Small nudge from puckline (favored tends to score slightly more)
-    Then apply calibration: scale (γ) each side and add bias (β) to the total.
-    """
+    """Projected goals for each side with calibration (γ scale, β bias)."""
     home_base = max(0.5, (row.get("xgf60_home", 2.7) + row.get("xga60_away", 2.7)) / 2.0)
     away_base = max(0.5, (row.get("xgf60_away", 2.7) + row.get("xga60_home", 2.7)) / 2.0)
 
@@ -171,10 +162,9 @@ def predict_goals(row):
     away_base -= 0.08 * g
 
     pl = float(row.get("puckline_home", -1.5))
-    home_base += -0.10 * pl      # -1.5 -> +0.15
-    away_base  -= -0.10 * pl     # -1.5 -> -0.15
+    home_base += -0.10 * pl
+    away_base  -= -0.10 * pl
 
-    # calibration
     home_g = max(0.8, home_base) * goals_scale
     away_g = max(0.8, away_base) * goals_scale
     total_g = home_g + away_g + goals_bias
@@ -186,23 +176,53 @@ def predict_goals(row):
     }
 
 def compute_total(row):
-    """Blend of the heuristic model and the projected-goals model."""
-    market_shift_total, total_score = compute_total_heuristic(row)
-    goals_proj_total = predict_goals(row)["Pred_Total_Goals"]
-
-    blended_total = totals_alpha * goals_proj_total + (1 - totals_alpha) * market_shift_total
+    """Totals side using rule: Blend / Goals only / Heuristic only / Consensus."""
     market_total = float(row.get("total", 6.0))
 
-    over_prob = sigmoid(blended_total - market_total, scale_total)
-    pick = "Over" if blended_total >= market_total else "Under"
+    # Heuristic & Goals projections
+    market_shift_total, total_score = compute_total_heuristic(row)
+    goals_proj = predict_goals(row)["Pred_Total_Goals"]
+
+    rule = st.session_state.get("g_totals_rule", "Blend (use α)")
+    if rule == "Goals only":
+        chosen_total = goals_proj
+        rationale = "goals"
+    elif rule == "Heuristic only":
+        chosen_total = market_shift_total
+        rationale = "heuristic"
+    elif rule == "Consensus (both must agree)":
+        side_goals = goals_proj - market_total
+        side_heu   = market_shift_total - market_total
+        if side_goals * side_heu > 0:
+            chosen_total = 0.5 * (goals_proj + market_shift_total)
+            rationale = "consensus"
+        else:
+            # Disagree => no totals pick
+            return {
+                "TotalScore": total_score,
+                "ProjectedDeltaGoals": 0.0,
+                "OU_Pick": "No Pick",
+                "OU_Confidence_%": 0.0,
+                "Blended_Total": 0.5 * (goals_proj + market_shift_total),
+                "Chosen_Total": 0.5 * (goals_proj + market_shift_total),
+                "Rationale": "disagree",
+            }
+    else:  # Blend
+        chosen_total = totals_alpha * goals_proj + (1 - totals_alpha) * market_shift_total
+        rationale = "blend"
+
+    over_prob = sigmoid(chosen_total - market_total, scale_total)
+    pick = "Over" if chosen_total >= market_total else "Under"
     conf_pct = round(abs(over_prob - 0.5) * 200, 1)
 
     return {
         "TotalScore": total_score,
-        "ProjectedDeltaGoals": blended_total - market_total,
+        "ProjectedDeltaGoals": chosen_total - market_total,
         "OU_Pick": f"{pick} {market_total:.1f}",
         "OU_Confidence_%": conf_pct,
-        "Blended_Total": blended_total,
+        "Blended_Total": totals_alpha * goals_proj + (1 - totals_alpha) * market_shift_total,
+        "Chosen_Total": chosen_total,
+        "Rationale": rationale,
     }
 
 def score_game(row):
@@ -218,7 +238,8 @@ def score_game(row):
         "Pred_Home_Goals": proj["Pred_Home_Goals"],
         "Pred_Away_Goals": proj["Pred_Away_Goals"],
         "Pred_Total_Goals": proj["Pred_Total_Goals"],
-        "Model_Total": tot["Blended_Total"],
+        "Model_Total": tot["Chosen_Total"],
+        "Model_Total_Rationale": tot["Rationale"],
         "LockScore": round(lock_score, 1)
     }
 
@@ -265,8 +286,9 @@ with tabs[0]:
                 st.info("Not strong enough for 🔒 by your threshold.")
             st.markdown(
                 f"**Projected Score:** {home} {result['Pred_Home_Goals']:.2f} — "
-                f"{away} {result['Pred_Away_Goals']:.2f}  *(Projected Total {result['Pred_Total_Goals']:.2f}; "
-                f"Model Total {result['Model_Total']:.2f})*"
+                f"{away} {result['Pred_Away_Goals']:.2f}  "
+                f"*(Projected Total {result['Pred_Total_Goals']:.2f}; "
+                f"Model Total {result['Model_Total']:.2f} via {result['Model_Total_Rationale']})*"
             )
 
 # --- Advanced (full inputs) ---
@@ -334,8 +356,9 @@ with tabs[1]:
                 st.info("Not strong enough for 🔒 by your threshold.")
             st.markdown(
                 f"**Projected Score:** {home_a} {result['Pred_Home_Goals']:.2f} — "
-                f"{away_a} {result['Pred_Away_Goals']:.2f}  *(Projected Total {result['Pred_Total_Goals']:.2f}; "
-                f"Model Total {result['Model_Total']:.2f})*"
+                f"{away_a} {result['Pred_Away_Goals']:.2f}  "
+                f"*(Projected Total {result['Pred_Total_Goals']:.2f}; "
+                f"Model Total {result['Model_Total']:.2f} via {result['Model_Total_Rationale']})*"
             )
 
 # --- Batch (CSV) ---
