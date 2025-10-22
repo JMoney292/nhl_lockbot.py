@@ -351,7 +351,7 @@ with tabs[0]:
                 st.info("Not strong enough for 🔒 by your threshold.")
 
 # --- Advanced (full inputs) ---
-with tabs[1]:
+with tabs[1]: 
     st.subheader("Full Inputs (optional)")
     c1, c2, c3 = st.columns(3)
     with c1:
