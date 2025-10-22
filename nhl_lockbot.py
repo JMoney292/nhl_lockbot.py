@@ -1,6 +1,6 @@
 # nhl_lockbot.py
-# LockBot NHL — NFL-style Simple Mode + Advanced + Batch + Projected Score
-# -----------------------------------------------------------------------
+# LockBot NHL — NFL-style Simple Mode + Advanced + Batch + Projected Score + OU Blend
+# -----------------------------------------------------------------------------------
 # Simple mode: teams, puckline(home), total, ratings (optional L10 & B2B).
 # Advanced: full controls (xG, injuries, goalie, travel, etc.).
 # Batch: simple CSV or advanced CSV.
@@ -18,7 +18,7 @@ st.caption("Quick inputs like your NFL app. ML / Puckline / Total picks with con
 # ---------- Sidebar (globals) ----------
 st.sidebar.header("Global Settings")
 scale_win   = st.sidebar.number_input("Sigmoid Scale (Win)", 5.0, 60.0, 22.0, 1.0, key="g_scale_win")
-scale_total = st.sidebar.number_input("Sigmoid Scale (Total)", 2.0, 40.0, 12.0, 1.0, key="g_scale_tot")
+scale_total = st.sidebar.number_input("Sigmoid Scale (Total)", 2.0, 40.0, 10.0, 1.0, key="g_scale_tot")
 goal_to_winprob = st.sidebar.slider("Win Prob shift per 1.0 goal (puckline)", 0.06, 0.22, 0.14, 0.01, key="g_goalmap")
 FOLLOW_ML_MARGIN = st.sidebar.slider("ATS follows ML unless opposite edge ≥ (%)", 0.0, 8.0, 3.0, 0.5, key="g_follow") / 100.0
 lock_min_conf = st.sidebar.slider("Lock Threshold %", 50, 90, 66, 1, key="g_lockthresh")
@@ -26,11 +26,11 @@ lock_min_conf = st.sidebar.slider("Lock Threshold %", 50, 90, 66, 1, key="g_lock
 st.sidebar.markdown("---")
 st.sidebar.subheader("Weights — Win/ATS")
 w = {
-    "rating": st.sidebar.slider("Rating Differential",        0.0, 2.5, 1.0, 0.05, key="w_rating"),
-    "form":   st.sidebar.slider("Recent Form (W% L10)",       0.0, 2.0, 0.6, 0.05, key="w_form"),
+    "rating": st.sidebar.slider("Rating Differential",        0.0, 2.5, 0.8, 0.05, key="w_rating"),
+    "form":   st.sidebar.slider("Recent Form (W% L10)",       0.0, 2.0, 0.9, 0.05, key="w_form"),
     "match":  st.sidebar.slider("5v5 Matchup (xG)",           0.0, 2.0, 0.9, 0.05, key="w_match"),
     "spec":   st.sidebar.slider("Special Teams (PP vs PK)",   0.0, 1.5, 0.5, 0.05, key="w_spec"),
-    "home":   st.sidebar.slider("Home Ice Edge",              0.0, 1.5, 0.5, 0.05, key="w_home"),
+    "home":   st.sidebar.slider("Home Ice Edge",              0.0, 1.5, 0.6, 0.05, key="w_home"),
     "rest":   st.sidebar.slider("Rest Edge (days diff)",      0.0, 2.0, 0.6, 0.05, key="w_rest"),
     "b2b":    st.sidebar.slider("Back-to-Back Penalty",       0.0, 2.0, 0.8, 0.05, key="w_b2b"),
     "inj_off":st.sidebar.slider("Injuries — Off",             0.0, 2.0, 0.6, 0.05, key="w_injoff"),
@@ -40,14 +40,20 @@ w = {
     "market": st.sidebar.slider("Market Sanity (sign check)", 0.0, 1.5, 0.4, 0.05, key="w_market"),
 }
 
-st.sidebar.subheader("Weights — Totals")
+st.sidebar.subheader("Weights — Totals (OU heuristic part)")
 wt = {
-    "xgpace": st.sidebar.slider("xG Pace vs avg",       0.0, 2.0, 1.0, 0.05, key="wt_pace"),
-    "finish": st.sidebar.slider("Finishing (hot/cold)", 0.0, 1.5, 0.5, 0.05, key="wt_finish"),
-    "save":   st.sidebar.slider("Goalie Save Impact",   0.0, 1.5, 0.7, 0.05, key="wt_save"),
-    "recent": st.sidebar.slider("Recent O/U Trend",     0.0, 1.5, 0.5, 0.05, key="wt_recent"),
-    "inj":    st.sidebar.slider("Injuries (O + D)",     0.0, 1.5, 0.5, 0.05, key="wt_inj"),
+    "xgpace": st.sidebar.slider("xG Pace vs avg",       0.0, 2.0, 1.3, 0.05, key="wt_pace"),
+    "finish": st.sidebar.slider("Finishing (hot/cold)", 0.0, 1.5, 0.8, 0.05, key="wt_finish"),
+    "save":   st.sidebar.slider("Goalie Save Impact",   0.0, 1.5, 0.5, 0.05, key="wt_save"),
+    "recent": st.sidebar.slider("Recent O/U Trend",     0.0, 1.5, 0.8, 0.05, key="wt_recent"),
+    "inj":    st.sidebar.slider("Injuries (O + D)",     0.0, 1.5, 0.6, 0.05, key="wt_inj"),
 }
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Totals Blending & Calibration")
+totals_alpha = st.sidebar.slider("Blend α (Goals model vs Heuristic)", 0.0, 1.0, 0.75, 0.05, key="g_alpha")
+goals_scale  = st.sidebar.slider("Goals scale (γ)", 0.9, 1.2, 1.05, 0.01, key="g_goals_scale")
+goals_bias   = st.sidebar.slider("Goals bias (β, adds to total)", 0.0, 0.5, 0.15, 0.01, key="g_goals_bias")
 
 # ---------- Helpers ----------
 def sigmoid(x, scale):
@@ -125,7 +131,8 @@ def compute_win(row):
         "Win_Confidence_%": conf_pct
     }
 
-def compute_total(row):
+def compute_total_heuristic(row):
+    """Old heuristic total model → a projected total around the market number."""
     xgpace_home = row.get("xgf60_home",2.7) + row.get("xga60_home",2.7)
     xgpace_away = row.get("xgf60_away",2.7) + row.get("xga60_away",2.7)
     pace_term   = (xgpace_home + xgpace_away)/2.0 - 5.0
@@ -138,22 +145,17 @@ def compute_total(row):
 
     total_score = wt["xgpace"]*pace_term + wt["finish"]*finish_term + wt["save"]*save_term + wt["inj"]*inj_term + wt["recent"]*recent_ou
     market_total = float(row.get("total", 6.0))
-    projected_delta = total_score * 0.6
-    over_prob = sigmoid(projected_delta, scale_total)
-    pick = "Over" if over_prob >= 0.5 else "Under"
-    conf_pct = round(abs(over_prob - 0.5) * 200, 1)
-    return {
-        "TotalScore": total_score, "ProjectedDeltaGoals": projected_delta,
-        "OU_Pick": f"{pick} {market_total:.1f}", "OU_Confidence_%": conf_pct
-    }
+    market_shift_total = market_total + total_score * 0.6
+    return market_shift_total, total_score
 
-# ---- NEW: Projected Score (goals) ----
+# ---- Projected Score (goals) ----
 def predict_goals(row):
     """
     Lightweight goals model (per 60):
     - Base from each side's xGF/60 vs opponent xGA/60
     - Finishing, injuries (own off & opp def), goalie edge
     - Small nudge from puckline (favored tends to score slightly more)
+    Then apply calibration: scale (γ) each side and add bias (β) to the total.
     """
     home_base = max(0.5, (row.get("xgf60_home", 2.7) + row.get("xga60_away", 2.7)) / 2.0)
     away_base = max(0.5, (row.get("xgf60_away", 2.7) + row.get("xga60_home", 2.7)) / 2.0)
@@ -172,12 +174,35 @@ def predict_goals(row):
     home_base += -0.10 * pl      # -1.5 -> +0.15
     away_base  -= -0.10 * pl     # -1.5 -> -0.15
 
-    home_g = max(0.8, home_base)
-    away_g = max(0.8, away_base)
+    # calibration
+    home_g = max(0.8, home_base) * goals_scale
+    away_g = max(0.8, away_base) * goals_scale
+    total_g = home_g + away_g + goals_bias
+
     return {
         "Pred_Home_Goals": round(home_g, 2),
         "Pred_Away_Goals": round(away_g, 2),
-        "Pred_Total_Goals": round(home_g + away_g, 2),
+        "Pred_Total_Goals": round(total_g, 2),
+    }
+
+def compute_total(row):
+    """Blend of the heuristic model and the projected-goals model."""
+    market_shift_total, total_score = compute_total_heuristic(row)
+    goals_proj_total = predict_goals(row)["Pred_Total_Goals"]
+
+    blended_total = totals_alpha * goals_proj_total + (1 - totals_alpha) * market_shift_total
+    market_total = float(row.get("total", 6.0))
+
+    over_prob = sigmoid(blended_total - market_total, scale_total)
+    pick = "Over" if blended_total >= market_total else "Under"
+    conf_pct = round(abs(over_prob - 0.5) * 200, 1)
+
+    return {
+        "TotalScore": total_score,
+        "ProjectedDeltaGoals": blended_total - market_total,
+        "OU_Pick": f"{pick} {market_total:.1f}",
+        "OU_Confidence_%": conf_pct,
+        "Blended_Total": blended_total,
     }
 
 def score_game(row):
@@ -193,6 +218,7 @@ def score_game(row):
         "Pred_Home_Goals": proj["Pred_Home_Goals"],
         "Pred_Away_Goals": proj["Pred_Away_Goals"],
         "Pred_Total_Goals": proj["Pred_Total_Goals"],
+        "Model_Total": tot["Blended_Total"],
         "LockScore": round(lock_score, 1)
     }
 
@@ -239,7 +265,8 @@ with tabs[0]:
                 st.info("Not strong enough for 🔒 by your threshold.")
             st.markdown(
                 f"**Projected Score:** {home} {result['Pred_Home_Goals']:.2f} — "
-                f"{away} {result['Pred_Away_Goals']:.2f}  *(Total {result['Pred_Total_Goals']:.2f})*"
+                f"{away} {result['Pred_Away_Goals']:.2f}  *(Projected Total {result['Pred_Total_Goals']:.2f}; "
+                f"Model Total {result['Model_Total']:.2f})*"
             )
 
 # --- Advanced (full inputs) ---
@@ -307,7 +334,8 @@ with tabs[1]:
                 st.info("Not strong enough for 🔒 by your threshold.")
             st.markdown(
                 f"**Projected Score:** {home_a} {result['Pred_Home_Goals']:.2f} — "
-                f"{away_a} {result['Pred_Away_Goals']:.2f}  *(Total {result['Pred_Total_Goals']:.2f})*"
+                f"{away_a} {result['Pred_Away_Goals']:.2f}  *(Projected Total {result['Pred_Total_Goals']:.2f}; "
+                f"Model Total {result['Model_Total']:.2f})*"
             )
 
 # --- Batch (CSV) ---
@@ -319,7 +347,7 @@ with tabs[2]:
         ex = pd.DataFrame([{
             "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,
             "rating_home":1620,"rating_away":1605,"l10_home_winpct":0.60,"l10_away_winpct":0.55,"b2b_home":0,"b2b_away":0
-        }])
+        }]])
     else:
         st.caption("Advanced CSV requires all columns used by the Advanced tab.")
         ex = pd.DataFrame([{
@@ -330,7 +358,7 @@ with tabs[2]:
             "b2b_home":0,"b2b_away":0,"inj_off_home":0.4,"inj_off_away":1.0,"inj_def_home":0.2,"inj_def_away":0.5,
             "goalie_edge_home":0.6,"fin_home":0.2,"fin_away":-0.1,"recent_ou_home":0.3,"recent_ou_away":-0.2,
             "travel_home":0,"travel_away":450
-        }])
+        }]])
     st.download_button("Download CSV Template", ex.to_csv(index=False).encode(),
                        "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
 
