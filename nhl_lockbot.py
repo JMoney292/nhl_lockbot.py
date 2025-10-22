@@ -1,6 +1,6 @@
 # nhl_lockbot.py
 # LockBot NHL — Simple + Advanced + Batch
-# Adds: Home/Away Win %, Predicted Score, Puckline & OU, L5 Totals, Blend/Rule
+# Adds: Home/Away Win %, Predicted Score, Puckline & OU, L5 Totals, L5 GF/GA, Blend/Rule
 
 import math
 import pandas as pd
@@ -9,7 +9,7 @@ import streamlit as st
 # ---------- App config ----------
 st.set_page_config(page_title="LockBot NHL (NFL-style)", layout="wide")
 st.title("🏒 LockBot NHL — NFL-style Simple Mode")
-st.caption("Home/Away win %, projected score, puckline & total picks. Tunable totals (goals vs heuristic), L5 totals, and batch mode.")
+st.caption("Home/Away win %, projected score, puckline & total picks. Tunable totals (goals vs heuristic), L5 totals, L5 GF/GA, and batch mode.")
 
 # ---------- Sidebar (globals) ----------
 st.sidebar.header("Global Settings")
@@ -55,7 +55,10 @@ pick_rule = st.sidebar.selectbox(
     ["Blend (use α)", "Goals only", "Heuristic only", "Consensus (both must agree)"],
     index=0, key="g_totals_rule"
 )
+
+# NEW: blend per-team L5 GF/GA into projected goals
 l5_weight = st.sidebar.slider("Weight of L5 game totals in heuristic", 0.0, 1.0, 0.50, 0.05, key="g_l5_weight")
+gfga_weight = st.sidebar.slider("Weight of L5 GF/GA in projected score", 0.0, 1.0, 0.50, 0.05, key="g_gfga_weight")
 
 # ---------- Helpers ----------
 def sigmoid(x, scale):
@@ -75,6 +78,8 @@ def fill_defaults_minimal(row):
         "recent_ou_home": 0.0, "recent_ou_away": 0.0,
         "travel_home": 0.0, "travel_away": 0.0,
         "l5_total_home": None, "l5_total_away": None,
+        # NEW: L5 GF/GA
+        "l5_gf_home": None, "l5_ga_home": None, "l5_gf_away": None, "l5_ga_away": None,
     }
     for k, v in defaults.items():
         row.setdefault(k, v)
@@ -106,17 +111,14 @@ def compute_win(row):
     comps = win_score_components(row)
     winscore = sum(w[k] * comps[k] for k in comps)
 
-    # model probability that HOME wins
     p_home = sigmoid(winscore, scale_win)
     p_away = 1.0 - p_home
 
-    # ML side text
     ml_team = row.get("home") if p_home >= 0.5 else row.get("away")
 
-    # puckline is from HOME perspective (negative if home favored)
     puckline_home = float(row.get("puckline_home", -1.5))
     implied_shift = -puckline_home * goal_to_winprob
-    spread_edge = (p_home - 0.5) - implied_shift  # >0 → model likes HOME vs market
+    spread_edge = (p_home - 0.5) - implied_shift
 
     def fmt_home(pl): return f"{row.get('home')} {pl:+.1f}"
     def fmt_away(pl): return f"{row.get('away')} {(-pl):+.1f}"
@@ -133,23 +135,18 @@ def compute_win(row):
             fav = row.get('home') if puckline_home < 0 else row.get('away')
             spread_pick = f"{fav} ML"
 
-    # format percents
-    home_pct = round(p_home * 100, 1)
-    away_pct = round(p_away * 100, 1)
-    conf_pct = round(abs(p_home - 0.5) * 200, 1)
-
     return {
         "WinScore": winscore,
         "HomeWinProb": p_home,
         "AwayWinProb": p_away,
-        "Home_Win_%": home_pct,
-        "Away_Win_%": away_pct,
+        "Home_Win_%": round(p_home * 100, 1),
+        "Away_Win_%": round(p_away * 100, 1),
         "ML_Pick": f"{ml_team} ML",
         "Spread_Pick": spread_pick,
-        "Win_Confidence_%": conf_pct,
+        "Win_Confidence_%": round(abs(p_home - 0.5) * 200, 1),
     }
 
-# ---------- Totals: heuristic (with L5) ----------
+# ---------- Totals: heuristic (with L5 totals) ----------
 def compute_total_heuristic(row):
     """Heuristic projection around the market total + L5 game totals blend."""
     xgpace_home = row.get("xgf60_home",2.7) + row.get("xga60_home",2.7)
@@ -166,7 +163,7 @@ def compute_total_heuristic(row):
     market_total = float(row.get("total", 6.0))
     base_heuristic_total = market_total + total_score * 0.6
 
-    # NFL-style L5 average game totals
+    # L5 average game totals (NFL-style)
     l5_home = row.get("l5_total_home", None)
     l5_away = row.get("l5_total_away", None)
     l5_vals = [v for v in [l5_home, l5_away] if v is not None]
@@ -178,22 +175,53 @@ def compute_total_heuristic(row):
 
     return heuristic_total, total_score
 
-# ---------- Projected score (goals) ----------
-def predict_goals(row):
-    """Projected goals for each side with calibration (γ scale, β bias)."""
-    home_base = max(0.5, (row.get("xgf60_home", 2.7) + row.get("xga60_away", 2.7)) / 2.0)
-    away_base = max(0.5, (row.get("xgf60_away", 2.7) + row.get("xga60_home", 2.7)) / 2.0)
+# ---------- Projected score (goals) with L5 GF/GA ----------
+def _mean_defined(values):
+    vals = [v for v in values if v is not None]
+    return sum(vals) / len(vals) if vals else None
 
+def predict_goals(row):
+    """
+    Project per-team goals using:
+      - xG side matchup: (xGF_home + xGA_away)/2, (xGF_away + xGA_home)/2
+      - L5 GF/GA side matchup: mean(Home L5 GF, Away L5 GA) etc., blended by gfga_weight
+      - finishing, injuries, goalie, puckline adjustments
+      - calibration: γ scale, β bias
+    """
+    # xG side matchups
+    xg_home = (row.get("xgf60_home", 2.7) + row.get("xga60_away", 2.7)) / 2.0
+    xg_away = (row.get("xgf60_away", 2.7) + row.get("xga60_home", 2.7)) / 2.0
+
+    # L5 GF/GA side signals (goals per game)
+    l5_home_gf = row.get("l5_gf_home", None)
+    l5_home_ga = row.get("l5_ga_home", None)
+    l5_away_gf = row.get("l5_gf_away", None)
+    l5_away_ga = row.get("l5_ga_away", None)
+
+    gfga_home = _mean_defined([l5_home_gf, l5_away_ga])  # home scored & away allowed
+    gfga_away = _mean_defined([l5_away_gf, l5_home_ga])  # away scored & home allowed
+
+    # Blend xG mean with L5 GF/GA mean if available
+    if gfga_weight > 0 and (gfga_home is not None or gfga_away is not None):
+        home_base = (1 - gfga_weight) * xg_home + gfga_weight * (gfga_home if gfga_home is not None else xg_home)
+        away_base = (1 - gfga_weight) * xg_away + gfga_weight * (gfga_away if gfga_away is not None else xg_away)
+    else:
+        home_base, away_base = xg_home, xg_away
+
+    # Finishing (form)
     home_base += 0.10 * row.get("fin_home", 0.0)
     away_base += 0.10 * row.get("fin_away", 0.0)
 
+    # Injuries (off gains, opp def losses)
     home_base += 0.10 * row.get("inj_off_home", 0.0) + 0.10 * row.get("inj_def_away", 0.0)
     away_base += 0.10 * row.get("inj_off_away", 0.0) + 0.10 * row.get("inj_def_home", 0.0)
 
+    # Goalie edge (positive favors home)
     g = row.get("goalie_edge_home", 0.0)
     home_base += 0.08 * g
     away_base -= 0.08 * g
 
+    # Puckline adjustment (favored home lowers away, raises home, etc.)
     pl = float(row.get("puckline_home", -1.5))
     home_base += -0.10 * pl
     away_base  -= -0.10 * pl
@@ -229,6 +257,7 @@ def compute_total(row):
             chosen_total = 0.5 * (goals_proj + heuristic_total)
             rationale = "consensus"
         else:
+            # Disagree → no totals pick
             return {
                 "TotalScore": total_score,
                 "ProjectedDeltaGoals": 0.0,
@@ -304,6 +333,9 @@ with tabs[0]:
         # NFL-style L5 totals
         l5_home = st.number_input("Home L5 avg game total (goals)", 3.0, 10.0, 6.2, 0.1, key="simp_l5_home")
         l5_away = st.number_input("Away L5 avg game total (goals)", 3.0, 10.0, 6.0, 0.1, key="simp_l5_away")
+        # NEW: L5 GF/GA
+        l5_gf_home = st.number_input("Home L5 GF (goals)", 1.0, 6.0, 3.1, 0.1, key="simp_l5_gf_h")
+        l5_ga_home = st.number_input("Home L5 GA (goals)", 1.0, 6.0, 2.9, 0.1, key="simp_l5_ga_h")
     with c2:
         rating_home = st.number_input("Home Rating / Power", 1200.0, 2000.0, 1610.0, 5.0, key="simp_rate_h")
         rating_away = st.number_input("Away Rating / Power", 1200.0, 2000.0, 1590.0, 5.0, key="simp_rate_a")
@@ -311,6 +343,9 @@ with tabs[0]:
         l10_away = st.slider("Away Win% (last 10)", 0.0, 1.0, 0.55, 0.05, key="simp_l10_a")
         b2b_home = st.checkbox("Home on B2B", False, key="simp_b2b_h")
         b2b_away = st.checkbox("Away on B2B", False, key="simp_b2b_a")
+        # NEW: Away L5 GF/GA
+        l5_gf_away = st.number_input("Away L5 GF (goals)", 1.0, 6.0, 3.0, 0.1, key="simp_l5_gf_a")
+        l5_ga_away = st.number_input("Away L5 GA (goals)", 1.0, 6.0, 3.0, 0.1, key="simp_l5_ga_a")
 
     if st.button("Score (Simple)", type="primary", key="simp_score_btn"):
         row = {
@@ -320,13 +355,14 @@ with tabs[0]:
             "l10_home_winpct": l10_home, "l10_away_winpct": l10_away,
             "b2b_home": int(b2b_home), "b2b_away": int(b2b_away),
             "l5_total_home": l5_home, "l5_total_away": l5_away,
+            "l5_gf_home": l5_gf_home, "l5_ga_home": l5_ga_home,
+            "l5_gf_away": l5_gf_away, "l5_ga_away": l5_ga_away,
         }
         row = fill_defaults_minimal(row)
         result = score_game(row)
         with st.container(border=True):
             st.markdown(f"**Matchup:** {home} vs {away}")
 
-            # Row: win %, puckline, total
             c1a, c2a, c3a, c4a = st.columns(4)
             c1a.metric(f"{home} Win %", f"{result['Home_Win_%']}%")
             c2a.metric(f"{away} Win %", f"{result['Away_Win_%']}%")
@@ -351,7 +387,7 @@ with tabs[0]:
                 st.info("Not strong enough for 🔒 by your threshold.")
 
 # --- Advanced (full inputs) ---
-with tabs[1]: 
+with tabs[1]:
     st.subheader("Full Inputs (optional)")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -361,6 +397,9 @@ with tabs[1]:
         total_a = st.number_input("Market Total (O/U, goals)", 4.5, 8.5, 6.0, 0.5, key="adv_total")
         l5_home_a = st.number_input("Home L5 avg game total (goals)", 3.0, 10.0, 6.2, 0.1, key="adv_l5_home")
         l5_away_a = st.number_input("Away L5 avg game total (goals)", 3.0, 10.0, 6.0, 0.1, key="adv_l5_away")
+        # NEW: L5 GF/GA
+        l5_gf_home_a = st.number_input("Home L5 GF (goals)", 1.0, 6.0, 3.1, 0.1, key="adv_l5_gf_h")
+        l5_ga_home_a = st.number_input("Home L5 GA (goals)", 1.0, 6.0, 2.9, 0.1, key="adv_l5_ga_h")
         travel_home = st.number_input("Travel Miles (Home)", 0.0, 5000.0, 0.0, 50.0, key="adv_travel_h")
         travel_away = st.number_input("Travel Miles (Away)", 0.0, 5000.0, 600.0, 50.0, key="adv_travel_a")
     with c2:
@@ -386,6 +425,9 @@ with tabs[1]:
         fin_away = st.slider("Away Finishing (± hot/cold)", -2.0, 2.0, -0.1, 0.1, key="adv_fin_a")
         recent_ou_home = st.slider("Home Recent O/U Trend (avg delta, +Over)", -2.0, 2.0, 0.3, 0.1, key="adv_ou_h")
         recent_ou_away = st.slider("Away Recent O/U Trend (avg delta, +Over)", -2.0, 2.0, -0.2, 0.1, key="adv_ou_a")
+        # NEW: Away L5 GF/GA
+        l5_gf_away_a = st.number_input("Away L5 GF (goals)", 1.0, 6.0, 3.0, 0.1, key="adv_l5_gf_a")
+        l5_ga_away_a = st.number_input("Away L5 GA (goals)", 1.0, 6.0, 3.0, 0.1, key="adv_l5_ga_a")
 
     if st.button("Score (Advanced)", key="adv_score_btn"):
         row = {
@@ -403,7 +445,10 @@ with tabs[1]:
             "goalie_edge_home": goalie_edge_home, "fin_home": fin_home, "fin_away": fin_away,
             "recent_ou_home": recent_ou_home, "recent_ou_away": recent_ou_away,
             "l5_total_home": l5_home_a, "l5_total_away": l5_away_a,
+            "l5_gf_home": l5_gf_home_a, "l5_ga_home": l5_ga_home_a,
+            "l5_gf_away": l5_gf_away_a, "l5_ga_away": l5_ga_away_a,
         }
+        row = fill_defaults_minimal(row)
         result = score_game(row)
         with st.container(border=True):
             st.markdown(f"**Matchup:** {home_a} vs {away_a}")
@@ -436,14 +481,16 @@ with tabs[2]:
     st.subheader("Batch — Upload CSV")
     simple_csv = st.toggle("Use Simple CSV format", value=True, key="batch_simple_toggle")
     if simple_csv:
-        st.caption("Simple CSV needs: home,away,puckline_home,total,rating_home,rating_away (optional l10/b2b,l5_totals).")
+        st.caption("Simple CSV needs: home,away,puckline_home,total,rating_home,rating_away (optional l10/b2b,l5_totals,l5_GF/GA).")
         ex = pd.DataFrame([{
             "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,
             "rating_home":1620,"rating_away":1605,"l10_home_winpct":0.60,"l10_away_winpct":0.55,
-            "b2b_home":0,"b2b_away":0,"l5_total_home":6.1,"l5_total_away":6.0
+            "b2b_home":0,"b2b_away":0,
+            "l5_total_home":6.1,"l5_total_away":6.0,
+            "l5_gf_home":3.1,"l5_ga_home":2.9,"l5_gf_away":3.0,"l5_ga_away":3.0
         }])
     else:
-        st.caption("Advanced CSV requires all columns used by the Advanced tab (L5 optional).")
+        st.caption("Advanced CSV requires all columns used by the Advanced tab (L5 fields optional).")
         ex = pd.DataFrame([{
             "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,
             "rating_home":1620,"rating_away":1605,
@@ -451,7 +498,9 @@ with tabs[2]:
             "l10_home_winpct":0.60,"l10_away_winpct":0.55,"rest_home":2,"rest_away":1,
             "b2b_home":0,"b2b_away":0,"inj_off_home":0.4,"inj_off_away":1.0,"inj_def_home":0.2,"inj_def_away":0.5,
             "goalie_edge_home":0.6,"fin_home":0.2,"fin_away":-0.1,"recent_ou_home":0.3,"recent_ou_away":-0.2,
-            "travel_home":0,"travel_away":450,"l5_total_home":6.1,"l5_total_away":6.0
+            "travel_home":0,"travel_away":450,
+            "l5_total_home":6.1,"l5_total_away":6.0,
+            "l5_gf_home":3.1,"l5_ga_home":2.9,"l5_gf_away":3.0,"l5_ga_away":3.0
         }])
     st.download_button("Download CSV Template", ex.to_csv(index=False).encode(),
                        "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
@@ -485,7 +534,6 @@ with tabs[2]:
                 out = pd.DataFrame([score_game(fill_defaults_minimal(dict(r))) for _, r in df.iterrows()]) \
                         .sort_values("LockScore", ascending=False).reset_index(drop=True)
 
-            # Reorder columns nicely
             cols = ["home","away","Home_Win_%","Away_Win_%","ML_Pick","Spread_Pick","OU_Pick",
                     "Pred_Home_Goals","Pred_Away_Goals","Pred_Total_Goals",
                     "Model_Total","Model_Total_Rationale",
