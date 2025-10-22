@@ -1,53 +1,55 @@
 # nhl_lockbot.py
-# LockBot NHL v1 — NFL-style UI (Simple + Advanced) with Batch
-# -------------------------------------------------------------
-# Simple mode: just teams, puckline(home), total, ratings, (optional) L10 + B2B.
-# Advanced mode: full controls (xG, injuries, goalie, travel, etc.).
-# Batch: accepts simple CSV (few columns) or advanced CSV (all columns).
+# LockBot NHL — NFL-style Simple Mode + Advanced + Batch (with unique keys)
+# -------------------------------------------------------------------------
+# Simple mode: enter teams, puckline (home perspective), total, ratings (optional L10 & B2B).
+# Advanced: full inputs (xG rates, injuries, goalie, travel, etc.).
+# Batch: supports simple CSV (few columns) or advanced CSV (full columns).
 #
-# Puckline is always entered from the HOME perspective (favored ⇒ negative).
+# Notes:
+# - Puckline is always entered from the HOME perspective (favored ⇒ negative).
+# - Locks: LockScore = 0.6*WinConf% + 0.4*OUConf% and compared to sidebar threshold.
 
 import math
 import pandas as pd
 import streamlit as st
 
-# ---------- Config ----------
+# ---------- App config ----------
 st.set_page_config(page_title="LockBot NHL (NFL-style)", layout="wide")
 st.title("🏒 LockBot NHL — NFL-style Simple Mode")
-st.caption("Quick inputs like your NFL app. Puckline/ML/Total picks + confidences. Batch mode + 🔒 Lock of the Day.")
+st.caption("Quick inputs like your NFL app. ML / Puckline / Total picks with confidence. Batch mode + Lock of the Day 🔒")
 
-# ---------- Sidebar (global) ----------
+# ---------- Sidebar (globals) ----------
 st.sidebar.header("Global Settings")
-scale_win   = st.sidebar.number_input("Sigmoid Scale (Win)", 5.0, 60.0, 22.0, 1.0)
-scale_total = st.sidebar.number_input("Sigmoid Scale (Total)", 2.0, 40.0, 12.0, 1.0)
-goal_to_winprob = st.sidebar.slider("Win Prob shift per 1.0 goal (puckline)", 0.06, 0.22, 0.14, 0.01)
-FOLLOW_ML_MARGIN = st.sidebar.slider("ATS follows ML unless opposite edge ≥ (%)", 0.0, 8.0, 3.0, 0.5) / 100.0
-lock_min_conf = st.sidebar.slider("Lock Threshold %", 50, 90, 66, 1)
+scale_win   = st.sidebar.number_input("Sigmoid Scale (Win)", 5.0, 60.0, 22.0, 1.0, key="g_scale_win")
+scale_total = st.sidebar.number_input("Sigmoid Scale (Total)", 2.0, 40.0, 12.0, 1.0, key="g_scale_tot")
+goal_to_winprob = st.sidebar.slider("Win Prob shift per 1.0 goal (puckline)", 0.06, 0.22, 0.14, 0.01, key="g_goalmap")
+FOLLOW_ML_MARGIN = st.sidebar.slider("ATS follows ML unless opposite edge ≥ (%)", 0.0, 8.0, 3.0, 0.5, key="g_follow") / 100.0
+lock_min_conf = st.sidebar.slider("Lock Threshold %", 50, 90, 66, 1, key="g_lockthresh")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Weights — Win/ATS")
 w = {
-    "rating": st.sidebar.slider("Rating Differential",        0.0, 2.5, 1.0, 0.05),
-    "form":   st.sidebar.slider("Recent Form (W% L10)",       0.0, 2.0, 0.6, 0.05),
-    "match":  st.sidebar.slider("5v5 Matchup (xG)",           0.0, 2.0, 0.9, 0.05),
-    "spec":   st.sidebar.slider("Special Teams (PP vs PK)",   0.0, 1.5, 0.5, 0.05),
-    "home":   st.sidebar.slider("Home Ice Edge",              0.0, 1.5, 0.5, 0.05),
-    "rest":   st.sidebar.slider("Rest Edge (days diff)",      0.0, 2.0, 0.6, 0.05),
-    "b2b":    st.sidebar.slider("Back-to-Back Penalty",       0.0, 2.0, 0.8, 0.05),
-    "inj_off":st.sidebar.slider("Injuries — Off",             0.0, 2.0, 0.6, 0.05),
-    "inj_def":st.sidebar.slider("Injuries — Def",             0.0, 2.0, 0.6, 0.05),
-    "goalie": st.sidebar.slider("Goalie Edge",                0.0, 2.0, 0.9, 0.05),
-    "travel": st.sidebar.slider("Travel Fatigue",             0.0, 1.5, 0.4, 0.05),
-    "market": st.sidebar.slider("Market Sanity (sign check)", 0.0, 1.5, 0.4, 0.05),
+    "rating": st.sidebar.slider("Rating Differential",        0.0, 2.5, 1.0, 0.05, key="w_rating"),
+    "form":   st.sidebar.slider("Recent Form (W% L10)",       0.0, 2.0, 0.6, 0.05, key="w_form"),
+    "match":  st.sidebar.slider("5v5 Matchup (xG)",           0.0, 2.0, 0.9, 0.05, key="w_match"),
+    "spec":   st.sidebar.slider("Special Teams (PP vs PK)",   0.0, 1.5, 0.5, 0.05, key="w_spec"),
+    "home":   st.sidebar.slider("Home Ice Edge",              0.0, 1.5, 0.5, 0.05, key="w_home"),
+    "rest":   st.sidebar.slider("Rest Edge (days diff)",      0.0, 2.0, 0.6, 0.05, key="w_rest"),
+    "b2b":    st.sidebar.slider("Back-to-Back Penalty",       0.0, 2.0, 0.8, 0.05, key="w_b2b"),
+    "inj_off":st.sidebar.slider("Injuries — Off",             0.0, 2.0, 0.6, 0.05, key="w_injoff"),
+    "inj_def":st.sidebar.slider("Injuries — Def",             0.0, 2.0, 0.6, 0.05, key="w_injdef"),
+    "goalie": st.sidebar.slider("Goalie Edge",                0.0, 2.0, 0.9, 0.05, key="w_goalie"),
+    "travel": st.sidebar.slider("Travel Fatigue",             0.0, 1.5, 0.4, 0.05, key="w_travel"),
+    "market": st.sidebar.slider("Market Sanity (sign check)", 0.0, 1.5, 0.4, 0.05, key="w_market"),
 }
 
 st.sidebar.subheader("Weights — Totals")
 wt = {
-    "xgpace": st.sidebar.slider("xG Pace vs avg",             0.0, 2.0, 1.0, 0.05),
-    "finish": st.sidebar.slider("Finishing (hot/cold)",       0.0, 1.5, 0.5, 0.05),
-    "save":   st.sidebar.slider("Goalie Save Impact",         0.0, 1.5, 0.7, 0.05),
-    "recent": st.sidebar.slider("Recent O/U Trend",           0.0, 1.5, 0.5, 0.05),
-    "inj":    st.sidebar.slider("Injuries (O + D)",           0.0, 1.5, 0.5, 0.05),
+    "xgpace": st.sidebar.slider("xG Pace vs avg",       0.0, 2.0, 1.0, 0.05, key="wt_pace"),
+    "finish": st.sidebar.slider("Finishing (hot/cold)", 0.0, 1.5, 0.5, 0.05, key="wt_finish"),
+    "save":   st.sidebar.slider("Goalie Save Impact",   0.0, 1.5, 0.7, 0.05, key="wt_save"),
+    "recent": st.sidebar.slider("Recent O/U Trend",     0.0, 1.5, 0.5, 0.05, key="wt_recent"),
+    "inj":    st.sidebar.slider("Injuries (O + D)",     0.0, 1.5, 0.5, 0.05, key="wt_inj"),
 }
 
 # ---------- Helpers ----------
@@ -168,19 +170,19 @@ with tabs[0]:
     st.subheader("Minimal Inputs")
     c1, c2 = st.columns(2)
     with c1:
-        home = st.text_input("Home Team", "BOS Bruins")
-        away = st.text_input("Away Team", "NY Rangers")
-        puckline_home = st.number_input("Puckline (Home; negative if favored)", -3.0, 3.0, -1.5, 0.5)
-        total = st.number_input("Market Total (O/U, goals)", 4.5, 8.5, 6.0, 0.5)
+        home = st.text_input("Home Team", "BOS Bruins", key="simp_home")
+        away = st.text_input("Away Team", "NY Rangers", key="simp_away")
+        puckline_home = st.number_input("Puckline (Home; negative if favored)", -3.0, 3.0, -1.5, 0.5, key="simp_pl")
+        total = st.number_input("Market Total (O/U, goals)", 4.5, 8.5, 6.0, 0.5, key="simp_total")
     with c2:
-        rating_home = st.number_input("Home Rating / Power", 1200.0, 2000.0, 1610.0, 5.0)
-        rating_away = st.number_input("Away Rating / Power", 1200.0, 2000.0, 1590.0, 5.0)
-        l10_home = st.slider("Home Win% (last 10)", 0.0, 1.0, 0.60, 0.05)
-        l10_away = st.slider("Away Win% (last 10)", 0.0, 1.0, 0.55, 0.05)
-        b2b_home = st.checkbox("Home on B2B", False)
-        b2b_away = st.checkbox("Away on B2B", False)
+        rating_home = st.number_input("Home Rating / Power", 1200.0, 2000.0, 1610.0, 5.0, key="simp_rate_h")
+        rating_away = st.number_input("Away Rating / Power", 1200.0, 2000.0, 1590.0, 5.0, key="simp_rate_a")
+        l10_home = st.slider("Home Win% (last 10)", 0.0, 1.0, 0.60, 0.05, key="simp_l10_h")
+        l10_away = st.slider("Away Win% (last 10)", 0.0, 1.0, 0.55, 0.05, key="simp_l10_a")
+        b2b_home = st.checkbox("Home on B2B", False, key="simp_b2b_h")
+        b2b_away = st.checkbox("Away on B2B", False, key="simp_b2b_a")
 
-    if st.button("Score (Simple)", type="primary"):
+    if st.button("Score (Simple)", type="primary", key="simp_score_btn"):
         row = {
             "home": home, "away": away,
             "puckline_home": puckline_home, "total": total,
@@ -202,7 +204,7 @@ with tabs[0]:
             else:
                 st.info("Not strong enough for 🔒 by your threshold.")
 
-# --- Advanced (keeps full control) ---
+# --- Advanced (full inputs) ---
 with tabs[1]:
     st.subheader("Full Inputs (optional)")
     c1, c2, c3 = st.columns(3)
@@ -210,34 +212,34 @@ with tabs[1]:
         home_a = st.text_input("Home Team", "BOS Bruins", key="adv_home")
         away_a = st.text_input("Away Team", "NY Rangers", key="adv_away")
         puckline_home_a = st.number_input("Puckline (Home; negative if favored)", -3.0, 3.0, -1.5, 0.5, key="adv_pl")
-        total_a = st.number_input("Market Total (O/U, goals)", 4.5, 8.5, 6.0, 0.5, key="adv_tot")
-        travel_home = st.number_input("Travel Miles (Home)", 0.0, 5000.0, 0.0, 50.0)
-        travel_away = st.number_input("Travel Miles (Away)", 0.0, 5000.0, 600.0, 50.0)
+        total_a = st.number_input("Market Total (O/U, goals)", 4.5, 8.5, 6.0, 0.5, key="adv_total")
+        travel_home = st.number_input("Travel Miles (Home)", 0.0, 5000.0, 0.0, 50.0, key="adv_travel_h")
+        travel_away = st.number_input("Travel Miles (Away)", 0.0, 5000.0, 600.0, 50.0, key="adv_travel_a")
     with c2:
-        rating_home_a = st.number_input("Home Rating / ELO", 1200.0, 2000.0, 1610.0, 5.0)
-        rating_away_a = st.number_input("Away Rating / ELO", 1200.0, 2000.0, 1590.0, 5.0)
-        xgf60_home  = st.number_input("Home xGF/60 (5v5)", 1.5, 4.0, 2.9, 0.05)
-        xga60_home  = st.number_input("Home xGA/60 (5v5)", 1.5, 4.0, 2.5, 0.05)
-        xgf60_away  = st.number_input("Away xGF/60 (5v5)", 1.5, 4.0, 2.6, 0.05)
-        xga60_away  = st.number_input("Away xGA/60 (5v5)", 1.5, 4.0, 2.7, 0.05)
+        rating_home_a = st.number_input("Home Rating / ELO", 1200.0, 2000.0, 1610.0, 5.0, key="adv_rate_h")
+        rating_away_a = st.number_input("Away Rating / ELO", 1200.0, 2000.0, 1590.0, 5.0, key="adv_rate_a")
+        xgf60_home  = st.number_input("Home xGF/60 (5v5)", 1.5, 4.0, 2.9, 0.05, key="adv_xgf_h")
+        xga60_home  = st.number_input("Home xGA/60 (5v5)", 1.5, 4.0, 2.5, 0.05, key="adv_xga_h")
+        xgf60_away  = st.number_input("Away xGF/60 (5v5)", 1.5, 4.0, 2.6, 0.05, key="adv_xgf_a")
+        xga60_away  = st.number_input("Away xGA/60 (5v5)", 1.5, 4.0, 2.7, 0.05, key="adv_xga_a")
     with c3:
-        l10_home_a = st.slider("Home Win% (last 10)", 0.0, 1.0, 0.60, 0.05)
-        l10_away_a = st.slider("Away Win% (last 10)", 0.0, 1.0, 0.55, 0.05)
-        rest_home = st.number_input("Home Rest Days", 0.0, 5.0, 2.0, 0.5)
-        rest_away = st.number_input("Away Rest Days", 0.0, 5.0, 1.0, 0.5)
-        b2b_home  = st.checkbox("Home on B2B", False, key="adv_b2bh")
-        b2b_away  = st.checkbox("Away on B2B", False, key="adv_b2ba")
-        inj_off_home = st.slider("Home Offense Missing (rel.)", 0.0, 5.0, 0.5, 0.1)
-        inj_off_away = st.slider("Away Offense Missing (rel.)", 0.0, 5.0, 1.0, 0.1)
-        inj_def_home = st.slider("Home Defense Missing (rel.)", 0.0, 5.0, 0.3, 0.1)
-        inj_def_away = st.slider("Away Defense Missing (rel.)", 0.0, 5.0, 0.6, 0.1)
-        goalie_edge_home = st.slider("Goalie Edge (Home − Away, + favors home)", -3.0, 3.0, 0.5, 0.1)
-        fin_home = st.slider("Home Finishing (± hot/cold)", -2.0, 2.0, 0.2, 0.1)
-        fin_away = st.slider("Away Finishing (± hot/cold)", -2.0, 2.0, -0.1, 0.1)
-        recent_ou_home = st.slider("Home Recent O/U Trend (avg delta, +Over)", -2.0, 2.0, 0.3, 0.1)
-        recent_ou_away = st.slider("Away Recent O/U Trend (avg delta, +Over)", -2.0, 2.0, -0.2, 0.1)
+        l10_home_a = st.slider("Home Win% (last 10)", 0.0, 1.0, 0.60, 0.05, key="adv_l10_h")
+        l10_away_a = st.slider("Away Win% (last 10)", 0.0, 1.0, 0.55, 0.05, key="adv_l10_a")
+        rest_home = st.number_input("Home Rest Days", 0.0, 5.0, 2.0, 0.5, key="adv_rest_h")
+        rest_away = st.number_input("Away Rest Days", 0.0, 5.0, 1.0, 0.5, key="adv_rest_a")
+        b2b_home  = st.checkbox("Home on B2B", False, key="adv_b2b_h")
+        b2b_away  = st.checkbox("Away on B2B", False, key="adv_b2b_a")
+        inj_off_home = st.slider("Home Offense Missing (rel.)", 0.0, 5.0, 0.5, 0.1, key="adv_injoff_h")
+        inj_off_away = st.slider("Away Offense Missing (rel.)", 0.0, 5.0, 1.0, 0.1, key="adv_injoff_a")
+        inj_def_home = st.slider("Home Defense Missing (rel.)", 0.0, 5.0, 0.3, 0.1, key="adv_injdef_h")
+        inj_def_away = st.slider("Away Defense Missing (rel.)", 0.0, 5.0, 0.6, 0.1, key="adv_injdef_a")
+        goalie_edge_home = st.slider("Goalie Edge (Home − Away, + favors home)", -3.0, 3.0, 0.5, 0.1, key="adv_goalie")
+        fin_home = st.slider("Home Finishing (± hot/cold)", -2.0, 2.0, 0.2, 0.1, key="adv_fin_h")
+        fin_away = st.slider("Away Finishing (± hot/cold)", -2.0, 2.0, -0.1, 0.1, key="adv_fin_a")
+        recent_ou_home = st.slider("Home Recent O/U Trend (avg delta, +Over)", -2.0, 2.0, 0.3, 0.1, key="adv_ou_h")
+        recent_ou_away = st.slider("Away Recent O/U Trend (avg delta, +Over)", -2.0, 2.0, -0.2, 0.1, key="adv_ou_a")
 
-    if st.button("Score (Advanced)"):
+    if st.button("Score (Advanced)", key="adv_score_btn"):
         row = {
             "home": home_a, "away": away_a,
             "puckline_home": puckline_home_a, "total": total_a,
@@ -269,13 +271,13 @@ with tabs[1]:
 # --- Batch (CSV) ---
 with tabs[2]:
     st.subheader("Batch — Upload CSV")
-    simple_csv = st.toggle("Use Simple CSV format", value=True)
+    simple_csv = st.toggle("Use Simple CSV format", value=True, key="batch_simple_toggle")
     if simple_csv:
-        st.caption("Simple CSV needs only: home,away,puckline_home,total,rating_home,rating_away (optional l10/b2b columns).")
+        st.caption("Simple CSV needs: home,away,puckline_home,total,rating_home,rating_away (optional l10/b2b).")
         ex = pd.DataFrame([{
             "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,"rating_home":1620,"rating_away":1605,
             "l10_home_winpct":0.60,"l10_away_winpct":0.55,"b2b_home":0,"b2b_away":0
-        }])
+        }]])
     else:
         st.caption("Advanced CSV requires all columns used by the Advanced tab.")
         ex = pd.DataFrame([{
@@ -286,10 +288,10 @@ with tabs[2]:
             "b2b_home":0,"b2b_away":0,"inj_off_home":0.4,"inj_off_away":1.0,"inj_def_home":0.2,"inj_def_away":0.5,
             "goalie_edge_home":0.6,"fin_home":0.2,"fin_away":-0.1,"recent_ou_home":0.3,"recent_ou_away":-0.2,
             "travel_home":0,"travel_away":450
-        }])
-    st.download_button("Download CSV Template", ex.to_csv(index=False).encode(), "nhl_lockbot_template.csv", "text/csv")
+        }]])
+    st.download_button("Download CSV Template", ex.to_csv(index=False).encode(), "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
 
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    uploaded = st.file_uploader("Upload CSV", type=["csv"], key="batch_uploader")
     if uploaded is not None:
         try:
             df = pd.read_csv(uploaded)
@@ -315,6 +317,7 @@ with tabs[2]:
             if len(out):
                 out.loc[0, "Lock"] = "🔒" if out.loc[0, "LockScore"] >= lock_min_conf else "(no 🔒)"
             st.dataframe(out, use_container_width=True)
-            st.download_button("Download Picks CSV", out.to_csv(index=False).encode(), "nhl_lockbot_picks.csv", "text/csv")
+            st.download_button("Download Picks CSV", out.to_csv(index=False).encode(),
+                               "nhl_lockbot_picks.csv", "text/csv", key="batch_out_dl")
         except Exception as e:
             st.exception(e)
