@@ -347,7 +347,7 @@ with tabs[2]:
         ex = pd.DataFrame([{
             "home":"BOS Bruins","away":"NY Rangers","puckline_home":-1.5,"total":6.0,
             "rating_home":1620,"rating_away":1605,"l10_home_winpct":0.60,"l10_away_winpct":0.55,"b2b_home":0,"b2b_away":0
-        }]])
+        }])
     else:
         st.caption("Advanced CSV requires all columns used by the Advanced tab.")
         ex = pd.DataFrame([{
@@ -358,7 +358,7 @@ with tabs[2]:
             "b2b_home":0,"b2b_away":0,"inj_off_home":0.4,"inj_off_away":1.0,"inj_def_home":0.2,"inj_def_away":0.5,
             "goalie_edge_home":0.6,"fin_home":0.2,"fin_away":-0.1,"recent_ou_home":0.3,"recent_ou_away":-0.2,
             "travel_home":0,"travel_away":450
-        }]])
+        }])
     st.download_button("Download CSV Template", ex.to_csv(index=False).encode(),
                        "nhl_lockbot_template.csv", "text/csv", key="batch_dl")
 
